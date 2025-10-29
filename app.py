@@ -16,7 +16,7 @@ import numpy as np
 # --- 1. Load and Preprocess Data ---
 # Load the CSV file
 try:
-    df = pd.read_csv('ROI Wind Forecast Sample.csv')
+    df = pd.read_csv('ROI_Wind_Forecast.csv')
 except FileNotFoundError:
     print("Error: 'ROI Wind Forecast Sample.csv' not found.")
     print("Please make sure the script is in the same directory as the CSV file.")
