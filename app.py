@@ -1,16 +1,28 @@
 #!/usr/bin/env python
 # coding: utf-8
 
-# In[1]:
+# In[ ]:
 
 
 import dash
 from dash import dcc, html, dash_table
 from dash.dependencies import Input, Output
 import plotly.graph_objects as go
+import plotly.express as px
 import pandas as pd
 import numpy as np
 import datetime
+import re
+
+# ==============================================================================
+# 1. DATA LOADING
+# ==============================================================================
+
+# ##############################################################################
+# [ACTION REQUIRED]
+# PASTE YOUR ORIGINAL DATA LOADING LOGIC FOR 'df' (Prices/Wind) HERE.
+# Ensure the resulting dataframe is named 'df' so the Outage Stats below can use it.
+# #################################################================#############
 
 # --- 1. Load and Preprocess Data ---
 
@@ -33,6 +45,14 @@ except ValueError:
         print(f"Error parsing timestamps: {e}")
         print("Please check the 'Timestamp' column format in your CSV.")
         exit()
+
+# --- Load Battery Optimizer Results ---
+try:
+    df_battery = pd.read_csv('battery_results.csv')
+    df_battery['date'] = pd.to_datetime(df_battery['date'])
+except FileNotFoundError:
+    print("Warning: 'battery_results.csv' not found. Run the optimizer script first.")
+    df_battery = pd.DataFrame(columns=['date', 'daily_pnl', 'cumulative'])
 
 # --- Preprocessing for BOTH Tabs ---
 
@@ -118,15 +138,134 @@ df['IDA3_PnL'] = np.where(
     0  # PnL is 0 outside trading hours
 )
 
-# --- 2. Initialize Dash App ---
+# (Placeholder to prevent crash if you run this without pasting your code first)
+if 'df' not in locals():
+    df = pd.DataFrame(columns=['Timestamp', 'Day Ahead Price', 'Balancing Price']) 
+
+
+# ==============================================================================
+# 2. OUTAGE DATA LOADING (NEW FEATURE - KEEP THIS)
+# ==============================================================================
+
+OUTAGE_FILE = 'UMM_Messages_2026-01.20T09_13_09.csv'
+PLANTS_TO_HIGHLIGHT = ["Whitegate", "Huntstown", "Dublin Bay"]
+
+OUTAGE_COLORS = {
+    'Target Portfolio': '#FF0000', 
+    'Fossil Gas': '#1f77b4', 'Fossil Hard coal': '#2ca02c', 
+    'Fossil Oil': '#8c564b', 'Biomass': '#9467bd',          
+    'Wind': '#17becf', 'Hydro': '#7f7f7f', 'Other': '#d3d3d3'
+}
+
+def load_outage_data():
+    try:
+        try:
+            df_out = pd.read_csv(OUTAGE_FILE, skiprows=3, encoding='cp1252')
+        except:
+            df_out = pd.read_csv(OUTAGE_FILE, skiprows=3, encoding='latin1')
+
+        if 'Status' in df_out.columns:
+            df_out = df_out[df_out['Status'] == 'Active'].copy()
+
+        # Fix Dates
+        date_regex = r'(\d{4}-\d{2})\.(\d{2})'
+        df_out['Event Start'] = df_out['Event Start'].astype(str).str.replace(date_regex, r'\1-\2', regex=True)
+        df_out['Event Stop'] = df_out['Event Stop'].astype(str).str.replace(date_regex, r'\1-\2', regex=True)
+        df_out['Event Start'] = pd.to_datetime(df_out['Event Start'], errors='coerce')
+        df_out['Event Stop'] = pd.to_datetime(df_out['Event Stop'], errors='coerce')
+        df_out = df_out.dropna(subset=['Event Start', 'Event Stop'])
+
+        # Fix Numeric MW
+        if 'Unavailable' in df_out.columns:
+            df_out['Unavailable'] = pd.to_numeric(df_out['Unavailable'], errors='coerce').fillna(0)
+
+        # Clean Names
+        def clean_name(row):
+            parts = str(row).split('|')
+            return parts[1].strip() if len(parts) > 1 else str(row)
+        df_out['Plant Name'] = df_out['Infrastructure'].apply(clean_name)
+
+        # Categorize
+        def get_category(row):
+            plant = row['Plant Name']
+            fuel = row['Fuel Type']
+            if any(h.lower() in plant.lower() for h in PLANTS_TO_HIGHLIGHT):
+                return 'Target Portfolio'
+            return fuel if pd.notna(fuel) else 'Other'
+        df_out['Category'] = df_out['Category'] = df_out.apply(get_category, axis=1)
+        
+        return df_out
+    except FileNotFoundError:
+        print("Outage file not found.")
+        return pd.DataFrame()
+
+df_outage = load_outage_data()
+
+# --- 3. Pre-Calculate Statistics for Tab 3 (NEW FEATURE - KEEP THIS) ---
+
+def calculate_outage_stats(price_df, outage_df):
+    if price_df.empty or outage_df.empty:
+        return []
+
+    # Tag periods
+    price_df['Outage_Active'] = 0
+    mask = outage_df['Category'] == 'Target Portfolio'
+    target_outages = outage_df[mask]
+
+    # Tagging
+    if 'Timestamp' in price_df.columns:
+        price_df = price_df.sort_values('Timestamp')
+        is_outage = pd.Series(0, index=price_df.index)
+        
+        for _, row in target_outages.iterrows():
+            start = row['Event Start']
+            stop = row['Event Stop']
+            mask_time = (price_df['Timestamp'] >= start) & (price_df['Timestamp'] < stop)
+            is_outage[mask_time] = 1
+        
+        price_df['Outage_Active'] = is_outage
+
+    # Calc Diff
+    if 'Day Ahead Price' in price_df.columns and 'Balancing Price' in price_df.columns:
+        price_df['Price_Diff'] = price_df['Day Ahead Price'] - price_df['Balancing Price']
+        
+        def get_stats(series, label):
+            return {
+                'Condition': label,
+                'Count': len(series),
+                'Mean': series.mean(),
+                'Std Dev': series.std(),
+                'Min': series.min(),
+                'Max': series.max(),
+                '25%': series.quantile(0.25),
+                '75%': series.quantile(0.75)
+            }
+
+        stats_data = []
+        stats_data.append(get_stats(price_df['Price_Diff'], 'Overall Dataset'))
+        tagged = price_df[price_df['Outage_Active'] == 1]['Price_Diff']
+        stats_data.append(get_stats(tagged, 'During Target Outages'))
+        untagged = price_df[price_df['Outage_Active'] == 0]['Price_Diff']
+        stats_data.append(get_stats(untagged, 'No Target Outages'))
+        
+        return stats_data
+    return []
+
+# Run calculation once (Uses the 'df' you loaded in Section 1)
+outage_stats_data = calculate_outage_stats(df.copy(), df_outage)
+
+
+# ==============================================================================
+# 4. APP LAYOUT
+# ==============================================================================
+# ---  Initialize Dash App ---
 app = dash.Dash(__name__, external_stylesheets=['https://codepen.io/chriddyp/pen/bWLwgP.css'])
 server = app.server  # For Gunicorn
-app.title = "Wind Forecast Dashboard"
+app.title = "Analytics Dashboard"
 
-# --- 3. Define App Layout ---
 app.layout = html.Div([
     
-    html.H1("Wind Dashboard: Accuracy & Intraday PnL", style={'textAlign': 'center'}),
+    html.H1("Analytics Dashboard", style={'textAlign': 'center'}),
 
     # --- GLOBAL FILTERS ---
     html.Div(className='container', style={'backgroundColor': '#f9f9f9', 'padding': '20px', 'borderRadius': '10px'}, children=[
@@ -185,10 +324,9 @@ app.layout = html.Div([
         ])
     ]),
     
-    # --- TABS CONTAINER ---
-    dcc.Tabs(id="dashboard-tabs", children=[
-        
-        # --- TAB 1: Forecast Accuracy ---
+    dcc.Tabs([
+        # --- TAB 1: Forecast Analysis ---
+         # --- TAB 1: Forecast Accuracy ---
         dcc.Tab(label='Forecast Accuracy', children=[
             html.Div([
                 # Graph
@@ -282,8 +420,74 @@ app.layout = html.Div([
                 
             ], style={'padding': '20px'})
         ]),
+ 
+        
+        # --- TAB 3: Outage Analysis (NEW - KEEP THIS) ---
+        dcc.Tab(label='Outage Analysis', children=[
+            html.Div([
+                html.H3("Power Plant Unavailability (MW)", style={'textAlign': 'center'}),
+                dcc.Graph(id='outage-stacked-bar'),
+                
+                html.Hr(),
+                
+                html.H3("Price Impact Statistics (Day Ahead - Balancing)", style={'textAlign': 'center'}),
+                html.P("Comparison of price spreads during periods of 'Target Portfolio' outages vs normal operations.", style={'textAlign': 'center'}),
+                
+                dash_table.DataTable(
+                    id='outage-stats-table',
+                    columns=[
+                        {'name': 'Condition', 'id': 'Condition'},
+                        {'name': 'Count (Periods)', 'id': 'Count'},
+                        {'name': 'Mean Diff (€)', 'id': 'Mean', 'type': 'numeric', 'format': {'specifier': '.2f'}},
+                        {'name': 'Std Dev', 'id': 'Std Dev', 'type': 'numeric', 'format': {'specifier': '.2f'}},
+                        {'name': 'Min', 'id': 'Min', 'type': 'numeric', 'format': {'specifier': '.2f'}},
+                        {'name': 'Max', 'id': 'Max', 'type': 'numeric', 'format': {'specifier': '.2f'}},
+                        {'name': '25%', 'id': '25%', 'type': 'numeric', 'format': {'specifier': '.2f'}},
+                        {'name': '75%', 'id': '75%', 'type': 'numeric', 'format': {'specifier': '.2f'}},
+                    ],
+                    data=outage_stats_data,
+                    style_cell={'textAlign': 'center', 'font-family': 'Arial'},
+                    style_header={'fontWeight': 'bold', 'backgroundColor': '#f2f2f2'},
+                    style_data_conditional=[
+                        {'if': {'filter_query': '{Condition} = "During Target Outages"'}, 'backgroundColor': '#ffcccc'} 
+                    ]
+                )
+            ], style={'padding': '20px'})
+        ]),
+
+        # --- TAB 4: Battery Optimizer ---
+        dcc.Tab(label='Battery Optimizer', children=[
+            html.Div([
+                html.H3("Battery Optimization Strategy Performance", style={'textAlign': 'center'}),
+                
+                # NEW: Control to switch chart views
+                html.Div([
+                    html.Label("Select View:", style={'fontWeight': 'bold', 'marginRight': '10px'}),
+                    dcc.RadioItems(
+                        id='battery-view-toggle',
+                        options=[
+                            {'label': 'Daily Performance (Bars)', 'value': 'daily'},
+                            {'label': 'Strategy Comparison (Cumulative Lines)', 'value': 'cumulative'}
+                        ],
+                        value='cumulative', # Default to the comparison view
+                        inline=True,
+                        style={'display': 'inline-block'}
+                    )
+                ], style={'textAlign': 'center', 'marginBottom': '20px'}),
+                
+                dcc.Graph(id='battery-plot'),
+                
+                html.Div(id='battery-stats-text', style={'textAlign': 'center', 'marginTop': '20px', 'fontStyle': 'italic'})
+                
+            ], style={'padding': '20px'})
+        ])
+        
     ])
 ])
+
+# ==============================================================================
+# 5. CALLBACKS
+# ==============================================================================
 
 # --- 4. Callback for TAB 1 (Accuracy) ---
 @app.callback(
@@ -648,15 +852,157 @@ def update_pnl_tab(wind_level, day_type, start_date, end_date, selected_months, 
 
     return fig, pnl_summary_children, da_revenue_str, scenario_data, scenario_columns
 
-# --- 5. Run the App ---
+# --- Callback for Outage Stacked Bar (NEW - KEEP THIS) ---
+# --- Callback for Outage Stacked Bar ---
+@app.callback(
+    Output('outage-stacked-bar', 'figure'),
+    [Input('date-range-picker', 'start_date')] # FIXED: ID updated to match Layout
+)
+def update_outage_chart(start_date):
+    # Debug print to ensure data is loaded
+    if df_outage.empty:
+        print("Debug: Outage DataFrame is empty. Check filename.")
+        return go.Figure()
+
+    # Fixed range: 19 Jan 2025 to 19 Jan 2026 as requested
+    s_date = pd.Timestamp("2025-01-19")
+    e_date = pd.Timestamp("2026-01-19")
+    
+    all_days = pd.date_range(start=s_date, end=e_date, freq='D')
+    categories = df_outage['Category'].unique()
+    
+    # Init empty DF
+    ts_df = pd.DataFrame(0.0, index=all_days, columns=categories)
+    
+    for _, row in df_outage.iterrows():
+        evt_start = max(row['Event Start'], s_date)
+        evt_end = min(row['Event Stop'], e_date)
+        mw = row['Unavailable']
+        cat = row['Category']
+        
+        if evt_start < evt_end:
+            ts_df.loc[evt_start:evt_end, cat] += mw
+
+    # Sort columns
+    cols = [c for c in ts_df.columns if c != 'Target Portfolio']
+    cols.sort()
+    if 'Target Portfolio' in ts_df.columns:
+        cols.append('Target Portfolio')
+    ts_df = ts_df[cols]
+
+    # Plot
+    fig = go.Figure()
+    
+    for col in ts_df.columns:
+        color = OUTAGE_COLORS.get(col, '#d3d3d3')
+        fig.add_trace(go.Bar(
+            x=ts_df.index,
+            y=ts_df[col],
+            name=col,
+            marker_color=color,
+            width=86400000 
+        ))
+
+    fig.update_layout(
+        barmode='stack',
+        title='Unavailable Capacity (MW)',
+        xaxis_title='Date',
+        yaxis_title='MW',
+        hovermode="x unified",
+        xaxis=dict(range=[s_date, e_date])
+    )
+    
+    return fig
+
+# --- Callback 5: Update Battery Plot (Tab 4) ---
+@app.callback(
+    [Output('battery-plot', 'figure'),
+     Output('battery-stats-text', 'children')],
+    [Input('date-range-picker', 'start_date'),
+     Input('battery-view-toggle', 'value')]
+)
+def update_battery_plot(start_date, view_mode):
+    try:
+        df_bat = pd.read_csv('battery_results.csv')
+        df_bat['date'] = pd.to_datetime(df_bat['date'])
+    except FileNotFoundError:
+        return go.Figure(), "Results file not found. Run the optimizer script first."
+
+    if df_bat.empty:
+        return go.Figure(), "No data available."
+
+    fig = go.Figure()
+    stats_msg = ""
+
+    # --- VIEW 1: DAILY BARS ---
+    if view_mode == 'daily':
+        # Determine colors based on market strategy
+        if 'market_used' in df_bat.columns:
+             # Red for Balancing, Blue for Day Ahead
+            colors = df_bat['market_used'].map({'Balancing': '#d62728', 'Day Ahead': '#1f77b4'})
+            # Fallback for any NaN values
+            colors = colors.fillna('#1f77b4')
+        else:
+            colors = '#1f77b4'
+
+        fig.add_trace(go.Bar(
+            x=df_bat['date'],
+            y=df_bat['total_profit'],  # <--- FIXED: Changed 'daily_pnl' to 'total_profit'
+            name='Daily P&L',
+            marker_color=colors
+        ))
+        
+        fig.update_layout(
+            title='Daily P&L (Red = Balancing Market Days)',
+            yaxis_title='Daily Profit (£)',
+            xaxis_title='Date'
+        )
+        stats_msg = "Red bars indicate days where the strategy switched to the Balancing Market due to high outages."
+
+    # --- VIEW 2: CUMULATIVE COMPARISON ---
+    else:
+        # If you have comparison columns from A/B testing, use them
+        if 'cumulative_baseline' in df_bat.columns:
+            fig.add_trace(go.Scatter(
+                x=df_bat['date'],
+                y=df_bat['cumulative_baseline'],
+                name='Baseline (Day Ahead Only)',
+                mode='lines',
+                line=dict(color='gray', width=2, dash='dash')
+            ))
+            
+            fig.add_trace(go.Scatter(
+                x=df_bat['date'],
+                y=df_bat['cumulative_strategy'],
+                name='Hybrid Strategy (Outage Aware)',
+                mode='lines',
+                line=dict(color='#2ca02c', width=3)
+            ))
+            
+            diff = df_bat['cumulative_strategy'].iloc[-1] - df_bat['cumulative_baseline'].iloc[-1]
+            stats_msg = f"The Hybrid Strategy outperformed the Baseline by £{diff:,.2f} over the period."
+            
+        else:
+            # Fallback for single strategy view (using 'cumulative')
+            fig.add_trace(go.Scatter(
+                x=df_bat['date'],
+                y=df_bat['cumulative'],
+                name='Cumulative P&L',
+                mode='lines',
+                line=dict(color='darkblue', width=3)
+            ))
+            stats_msg = "Showing cumulative performance for the current strategy."
+
+        fig.update_layout(
+            title='Cumulative Performance',
+            yaxis_title='Cumulative Profit (£)',
+            xaxis_title='Date',
+            hovermode="x unified"
+        )
+
+    fig.update_layout(template='plotly_white')
+    return fig, stats_msg
+
 if __name__ == '__main__':
-    # Changed debug=True to debug=False for production
-    # Added host='0.0.0.0' and port=8080, common for deployment
-    app.run(debug=False, host='0.0.0.0', port=8080)
-
-
-# In[ ]:
-
-
-
+    app.run(debug=True)
 
